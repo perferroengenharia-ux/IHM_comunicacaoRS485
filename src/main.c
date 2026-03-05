@@ -5,7 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -43,8 +43,10 @@
 #define TYPE_NACK           0x81
 
 #define MAX_PAYLOAD         128
-#define MAX_FRAME_RAW       (1 + 4 + MAX_PAYLOAD + 2)     // SOF + hdr + payload + CRC
-#define MAX_FRAME_ESC       (MAX_FRAME_RAW * 2)           // pior caso com escape
+#define MAX_FRAME_RAW       (1 + 4 + MAX_PAYLOAD + 2)
+#define MAX_FRAME_ESC       (MAX_FRAME_RAW * 2)
+
+#define FRAME_QUEUE_LEN     8
 
 static const char *TAG = "RS485_MASTER";
 
@@ -73,7 +75,7 @@ static inline void rs485_set_tx(bool tx_enable)
 }
 
 /* =========================
- *  Escape/Unescape helpers
+ *  Escape helper
  * ========================= */
 static size_t slip_escape(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max)
 {
@@ -95,7 +97,7 @@ static size_t slip_escape(const uint8_t *in, size_t in_len, uint8_t *out, size_t
 /* =========================
  *  Frame builder:
  *  [SOF][ADDR][TYPE][SEQ][LEN][PAYLOAD...][CRC16 L][CRC16 H]
- *  depois aplica escape em tudo EXCETO o SOF inicial
+ *  Escape em tudo EXCETO o SOF inicial
  * ========================= */
 static size_t build_frame(uint8_t addr, uint8_t type, uint8_t seq,
                           const uint8_t *payload, uint8_t len,
@@ -118,11 +120,10 @@ static size_t build_frame(uint8_t addr, uint8_t type, uint8_t seq,
     }
 
     // CRC cobre ADDR..PAYLOAD (não inclui SOF)
-    uint16_t crc = crc16_ibm(&raw[1], (idx - 1));
+    uint16_t crc = crc16_ibm(&raw[1], idx - 1);
     raw[idx++] = (uint8_t)(crc & 0xFF);
     raw[idx++] = (uint8_t)((crc >> 8) & 0xFF);
 
-    // out: SOF puro + escape do restante
     if (out_max < 1) return 0;
     out_escaped[0] = SOF;
 
@@ -171,20 +172,20 @@ static void parser_reset(frame_parser_t *p)
     p->addr = p->type = p->seq = p->len = 0;
     p->pay_i = 0;
     p->crc_l = p->crc_h = 0;
+    p->last_byte_us = 0;
 }
 
 static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
 {
     int64_t now = esp_timer_get_time();
 
-    // timeout inter-byte (ex.: 5ms)
-    if (p->st != PS_WAIT_SOF && (now - p->last_byte_us) > 5000) {
+    // timeout inter-byte (5ms)
+    if (p->st != PS_WAIT_SOF && p->last_byte_us != 0 && (now - p->last_byte_us) > 5000) {
         parser_reset(p);
     }
     p->last_byte_us = now;
 
     if (byte == SOF) {
-        // resync
         p->st = PS_HDR_ADDR;
         p->esc_next = false;
         p->pay_i = 0;
@@ -193,7 +194,6 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
 
     if (p->st == PS_WAIT_SOF) return false;
 
-    // unescape
     if (p->esc_next) {
         byte ^= ESC_XOR;
         p->esc_next = false;
@@ -206,6 +206,7 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
         case PS_HDR_ADDR: p->addr = byte; p->st = PS_HDR_TYPE; break;
         case PS_HDR_TYPE: p->type = byte; p->st = PS_HDR_SEQ; break;
         case PS_HDR_SEQ:  p->seq  = byte; p->st = PS_HDR_LEN; break;
+
         case PS_HDR_LEN:
             p->len = byte;
             if (p->len > MAX_PAYLOAD) { parser_reset(p); return false; }
@@ -219,75 +220,74 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
             break;
 
         case PS_CRC_L: p->crc_l = byte; p->st = PS_CRC_H; break;
-        case PS_CRC_H:
+
+        case PS_CRC_H: {
             p->crc_h = byte;
 
-            // valida CRC
-            {
-                uint8_t tmp[4 + MAX_PAYLOAD]; // ADDR TYPE SEQ LEN + payload
-                tmp[0] = p->addr;
-                tmp[1] = p->type;
-                tmp[2] = p->seq;
-                tmp[3] = p->len;
-                if (p->len) memcpy(&tmp[4], p->payload, p->len);
+            uint8_t tmp[4 + MAX_PAYLOAD];
+            tmp[0] = p->addr;
+            tmp[1] = p->type;
+            tmp[2] = p->seq;
+            tmp[3] = p->len;
+            if (p->len) memcpy(&tmp[4], p->payload, p->len);
 
-                uint16_t crc_calc = crc16_ibm(tmp, 4 + p->len);
-                uint16_t crc_rx = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
+            uint16_t crc_calc = crc16_ibm(tmp, 4 + p->len);
+            uint16_t crc_rx   = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
 
-                if (crc_calc == crc_rx) {
-                    out_frame->addr = p->addr;
-                    out_frame->type = p->type;
-                    out_frame->seq  = p->seq;
-                    out_frame->len  = p->len;
-                    if (p->len) memcpy(out_frame->payload, p->payload, p->len);
+            if (crc_calc == crc_rx) {
+                out_frame->addr = p->addr;
+                out_frame->type = p->type;
+                out_frame->seq  = p->seq;
+                out_frame->len  = p->len;
+                if (p->len) memcpy(out_frame->payload, p->payload, p->len);
 
-                    parser_reset(p);
-                    return true;
-                } else {
-                    ESP_LOGW(TAG, "CRC fail calc=0x%04X rx=0x%04X", crc_calc, crc_rx);
-                    parser_reset(p);
-                    return false;
-                }
+                parser_reset(p);
+                return true;
+            } else {
+                ESP_LOGW(TAG, "CRC fail calc=0x%04X rx=0x%04X", crc_calc, crc_rx);
+                parser_reset(p);
+                return false;
             }
-            break;
+        } break;
 
-        default: parser_reset(p); break;
+        default:
+            parser_reset(p);
+            break;
     }
 
     return false;
 }
 
 /* =========================
- *  RX Task + mailbox do "último frame"
+ *  RX Task -> Queue
  * ========================= */
-static frame_parser_t g_parser;
-static SemaphoreHandle_t g_frame_sem;
-static frame_t g_last_frame;
+static QueueHandle_t g_frame_q;
 
 static void rx_task(void *arg)
 {
     (void)arg;
     uint8_t buf[64];
-
-    parser_reset(&g_parser);
+    frame_parser_t parser;
+    parser_reset(&parser);
 
     while (1) {
         int n = uart_read_bytes(UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(50));
-        if (n > 0) {
-            for (int i = 0; i < n; i++) {
-                frame_t fr;
-                if (parser_feed(&g_parser, buf[i], &fr)) {
-                    // guarda o frame
-                    g_last_frame = fr;
-                    xSemaphoreGive(g_frame_sem);
+        for (int i = 0; i < n; i++) {
+            frame_t fr;
+            if (parser_feed(&parser, buf[i], &fr)) {
+                // Se fila cheia, descarta o mais antigo e insere o novo
+                if (uxQueueSpacesAvailable(g_frame_q) == 0) {
+                    frame_t dump;
+                    xQueueReceive(g_frame_q, &dump, 0);
                 }
+                xQueueSend(g_frame_q, &fr, 0);
             }
         }
     }
 }
 
 /* =========================
- *  Envia frame com troca TX->RX correta
+ *  Send frame (TX->RX) correto
  * ========================= */
 static esp_err_t rs485_send_frame(uint8_t addr, uint8_t type, uint8_t seq,
                                  const uint8_t *payload, uint8_t len)
@@ -296,8 +296,10 @@ static esp_err_t rs485_send_frame(uint8_t addr, uint8_t type, uint8_t seq,
     size_t txlen = build_frame(addr, type, seq, payload, len, txbuf, sizeof(txbuf));
     if (txlen == 0) return ESP_FAIL;
 
+    // limpa buffer RX para evitar lixo/frames velhos
+   ///uart_flush_input(UART_PORT);
+
     rs485_set_tx(true);
-    // pequeno settle para DE subir (opcional)
     esp_rom_delay_us(10);
 
     int w = uart_write_bytes(UART_PORT, (const char*)txbuf, txlen);
@@ -306,18 +308,56 @@ static esp_err_t rs485_send_frame(uint8_t addr, uint8_t type, uint8_t seq,
         return ESP_FAIL;
     }
 
-    // MUITO IMPORTANTE: esperar TX completo (shift register)
     esp_err_t e = uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(50));
 
-    // turnaround (2-3 chars @115200 ~ 200-300us)
-    esp_rom_delay_us(300);
-
+    // turnaround ~300us
     rs485_set_tx(false);
+    esp_rom_delay_us(20);
+    
     return e;
 }
 
 /* =========================
- *  Request/Response (mestre)
+ *  Helper: limpa frames pendentes na fila
+ * ========================= */
+static void purge_frame_queue(void)
+{
+    frame_t dump;
+    while (xQueueReceive(g_frame_q, &dump, 0) == pdTRUE) {}
+}
+
+/* =========================
+ *  Wait reply (filtra por addr+seq e aceita apenas ACK/NACK)
+ * ========================= */
+static bool wait_reply(uint8_t expected_seq, frame_t *reply, uint32_t timeout_ms)
+{
+    int64_t t0 = esp_timer_get_time();
+    while (1) {
+        int64_t now = esp_timer_get_time();
+        int64_t elapsed_ms = (now - t0) / 1000;
+        if (elapsed_ms >= (int64_t)timeout_ms) return false;
+
+        uint32_t remain_ms = (uint32_t)(timeout_ms - elapsed_ms);
+        TickType_t wait_ticks = pdMS_TO_TICKS(remain_ms);
+        if (wait_ticks == 0) wait_ticks = 1;
+
+        frame_t fr;
+        if (xQueueReceive(g_frame_q, &fr, wait_ticks) == pdTRUE) {
+            // valida addr + seq
+            if (fr.addr == ADDR_MASTER && fr.seq == expected_seq) {
+                // valida tipo
+                if (fr.type == TYPE_ACK || fr.type == TYPE_NACK) {
+                    if (reply) *reply = fr;
+                    return true;
+                }
+            }
+            // frame não era o esperado -> ignora e continua esperando dentro do timeout
+        }
+    }
+}
+
+/* =========================
+ *  Request/Response com retry
  * ========================= */
 static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
                           frame_t *reply, uint32_t timeout_ms)
@@ -325,11 +365,9 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
     static uint8_t seq = 0;
     seq++;
 
-    // limpa semáforo (se tiver frame velho)
-    while (xSemaphoreTake(g_frame_sem, 0) == pdTRUE) {}
+    purge_frame_queue();
 
     const int retry_max = 3;
-
     for (int r = 0; r < retry_max; r++) {
         if (rs485_send_frame(ADDR_STM32, type, seq, payload, len) != ESP_OK) {
             ESP_LOGW(TAG, "send fail retry=%d", r);
@@ -337,71 +375,58 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
             continue;
         }
 
-        // espera resposta
-        if (xSemaphoreTake(g_frame_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            frame_t fr = g_last_frame;
-
-            // valida se é para mim e seq bate
-            if (fr.addr == ADDR_MASTER && fr.seq == seq) {
-                // ok
-                if (reply) *reply = fr;
-                return true;
-            } else {
-                ESP_LOGW(TAG, "frame mismatch addr=0x%02X seq=%u", fr.addr, fr.seq);
-            }
-        } else {
-            ESP_LOGW(TAG, "timeout waiting reply (retry=%d)", r);
+        frame_t fr;
+        if (wait_reply(seq, &fr, timeout_ms)) {
+            if (reply) *reply = fr;
+            return true;
         }
+
+        ESP_LOGW(TAG, "timeout waiting reply (retry=%d)", r);
     }
 
     return false;
 }
 
 /* =========================
- *  Exemplos de comandos
+ *  Demo task
  * ========================= */
 static void demo_loop_task(void *arg)
 {
     (void)arg;
 
-    // 1) PING
     frame_t rep;
-    if (rs485_request(TYPE_PING, NULL, 0, &rep, 50)) {
-        ESP_LOGI(TAG, "PING reply type=0x%02X len=%u", rep.type, rep.len);
+
+    if (rs485_request(TYPE_PING, NULL, 0, &rep, 80)) {
+        ESP_LOGI(TAG, "PING -> reply type=0x%02X len=%u", rep.type, rep.len);
     } else {
         ESP_LOGE(TAG, "PING failed");
     }
 
-    // 2) SET_PWM (duty 0..100)
-    uint8_t duty = 35;
+    uint8_t duty = 49;
     uint8_t pl_pwm[1] = { duty };
-    if (rs485_request(TYPE_SET_PWM, pl_pwm, 1, &rep, 80)) {
-        ESP_LOGI(TAG, "SET_PWM ACK type=0x%02X", rep.type);
+    if (rs485_request(TYPE_SET_PWM, pl_pwm, 1, &rep, 120)) {
+        if (rep.type == TYPE_ACK) ESP_LOGI(TAG, "SET_PWM ACK");
+        else ESP_LOGW(TAG, "SET_PWM NACK err=%u", rep.len ? rep.payload[0] : 0);
     } else {
         ESP_LOGE(TAG, "SET_PWM failed");
     }
 
-    // 3) Loop periódico
     while (1) {
-        // READ_STATUS
-        if (rs485_request(TYPE_READ_STATUS, NULL, 0, &rep, 80)) {
+        if (rs485_request(TYPE_READ_STATUS, NULL, 0, &rep, 120)) {
             if (rep.type == TYPE_ACK && rep.len >= 2) {
-                // exemplo: payload[0]=estado, payload[1]=erro
-                ESP_LOGI(TAG, "STATUS state=%u err=%u", rep.payload[0], rep.payload[1]);
+                ESP_LOGI(TAG, "STATUS state=%u duty=%u", rep.payload[0], rep.payload[1]);
+            } else if (rep.type == TYPE_NACK) {
+                ESP_LOGW(TAG, "STATUS NACK err=%u", rep.len ? rep.payload[0] : 0);
             } else {
-                ESP_LOGI(TAG, "STATUS reply type=0x%02X len=%u", rep.type, rep.len);
+                ESP_LOGW(TAG, "STATUS unexpected reply type=0x%02X len=%u", rep.type, rep.len);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-/* =========================
- *  app_main
- * ========================= */
 void app_main(void)
 {
-    // RS485 EN pin
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << RS485_EN_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -409,10 +434,9 @@ void app_main(void)
         .pull_down_en = 0,
         .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&io);
-    rs485_set_tx(false); // inicia em RX
+    ESP_ERROR_CHECK(gpio_config(&io));
+    rs485_set_tx(false);
 
-    // UART config 115200 8E1
     uart_config_t cfg = {
         .baud_rate = UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -426,8 +450,12 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // semáforo e tasks
-    g_frame_sem = xSemaphoreCreateBinary();
+    g_frame_q = xQueueCreate(FRAME_QUEUE_LEN, sizeof(frame_t));
+    if (!g_frame_q) {
+        ESP_LOGE(TAG, "Failed to create frame queue");
+        return;
+    }
+
     xTaskCreate(rx_task, "rs485_rx", 4096, NULL, 10, NULL);
     xTaskCreate(demo_loop_task, "demo", 4096, NULL, 9, NULL);
 
