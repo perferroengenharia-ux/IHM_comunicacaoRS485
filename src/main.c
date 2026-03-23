@@ -13,73 +13,69 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 /* =========================
- * CONFIG - AJUSTE PINOS
+ * CONFIG - HARDWARE & UART
  * ========================= */
 #define UART_PORT           UART_NUM_2
 #define UART_TX_PIN         GPIO_NUM_17
 #define UART_RX_PIN         GPIO_NUM_16
 #define RS485_EN_PIN        GPIO_NUM_4   
-
 #define UART_BAUD           115200
 
 /* =========================
- * PROTOCOLO & CONSTANTES
+ * PROTOCOLO RS485
  * ========================= */
 #define SOF                 0x7E
 #define ESC                 0x7D
 #define ESC_XOR             0x20
 
 #define ADDR_STM32          0x01
-#define ADDR_MASTER         0xF0
-
 #define TYPE_READ_STATUS    0x04 
+#define TYPE_WRITE_PARAM    0x05
+#define TYPE_ACK_MI         0x06
 #define TYPE_ACK            0x80
-#define TYPE_NACK           0x81
 
 #define MAX_PAYLOAD         128
 #define MAX_FRAME_RAW       (1 + 4 + MAX_PAYLOAD + 2)
 #define MAX_FRAME_ESC       (MAX_FRAME_RAW * 2)
 
-#define FRAME_QUEUE_LEN     10
-
-static const char *TAG = "IHM_MASTER";
-
 /* =========================
- * PARÂMETROS (P90, P91, E08)
+ * ESTRUTURAS DE DADOS
  * ========================= */
-static uint8_t  P90 = 0;      
-static uint8_t  P91 = 3;     
-static bool     E08 = false;  
+typedef struct {
+    uint8_t id;
+    uint16_t value;
+    const char* name;
+} param_t;
+
+param_t params[] = {
+    {10, 300, "P10"}, {11, 600, "P11"}, {30, 100, "P30"}, {31, 100, "P31"}, {91, 15, "P91"}
+};
+#define ACTIVE_PARAMS_COUNT (sizeof(params)/sizeof(params[0]))
 
 typedef struct {
     uint8_t addr, type, seq, len, payload[MAX_PAYLOAD];
 } frame_t;
 
+static uint8_t  P90 = 0;      
+static uint8_t  P91 = 15; 
+static bool     E08 = false;  
+static QueueHandle_t g_frame_q = NULL;
+
 typedef struct {
     uint8_t  buttons;      
     uint16_t target_freq;  
-    uint16_t ramp_time;    
-    uint8_t  brake;        
-} ihm_cmd_t;
+} ihm_rt_data_t;
 
-typedef struct {
-    uint16_t current_speed; 
-    uint16_t motor_current; 
-    uint16_t bus_voltage;   
-    uint8_t  temp;          
-} mi_sensors_t;
-
-static ihm_cmd_t g_ihm_cmd = { .buttons = 0, .target_freq = 300, .ramp_time = 1000, .brake = 0 };
-static mi_sensors_t g_mi_status = { 0 };
-static QueueHandle_t g_frame_q = NULL;
+static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 600 }; // Teste: Start + 60Hz
 
 /* =========================
  * UTILITÁRIOS RS485 & CRC
  * ========================= */
-static uint16_t crc16_ibm(const uint8_t *data, size_t len)
-{
+static uint16_t crc16_ibm(const uint8_t *data, size_t len) {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
@@ -91,72 +87,51 @@ static uint16_t crc16_ibm(const uint8_t *data, size_t len)
     return crc;
 }
 
-static inline void rs485_set_tx(bool tx_enable)
-{
+static inline void rs485_set_tx(bool tx_enable) {
     gpio_set_level(RS485_EN_PIN, tx_enable ? 1 : 0);
 }
 
-static size_t slip_escape(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max)
-{
-    size_t j = 0;
-    for (size_t i = 0; i < in_len; i++) {
-        uint8_t b = in[i];
-        if (b == SOF || b == ESC) {
-            if (j + 2 > out_max) return 0;
-            out[j++] = ESC;
-            out[j++] = (uint8_t)(b ^ ESC_XOR);
+static size_t build_frame(uint8_t addr, uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len, uint8_t *out_esc, size_t out_max) {
+    uint8_t raw[MAX_FRAME_RAW];
+    size_t r_idx = 0;
+    raw[r_idx++] = SOF;
+    raw[r_idx++] = addr;
+    raw[r_idx++] = type;
+    raw[r_idx++] = seq;
+    raw[r_idx++] = len;
+    if (len && payload) { memcpy(&raw[r_idx], payload, len); r_idx += len; }
+    uint16_t crc = crc16_ibm(&raw[1], r_idx - 1);
+    raw[r_idx++] = (uint8_t)(crc & 0xFF);
+    raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    size_t e_idx = 0;
+    out_esc[e_idx++] = SOF;
+    for (size_t i = 1; i < r_idx; i++) {
+        if (raw[i] == SOF || raw[i] == ESC) {
+            out_esc[e_idx++] = ESC;
+            out_esc[e_idx++] = raw[i] ^ ESC_XOR;
         } else {
-            if (j + 1 > out_max) return 0;
-            out[j++] = b;
+            out_esc[e_idx++] = raw[i];
         }
     }
-    return j;
-}
-
-static size_t build_frame(uint8_t addr, uint8_t type, uint8_t seq,
-                          const uint8_t *payload, uint8_t len,
-                          uint8_t *out_escaped, size_t out_max)
-{
-    uint8_t raw[MAX_FRAME_RAW];
-    size_t idx = 0;
-    raw[idx++] = SOF;
-    raw[idx++] = addr;
-    raw[idx++] = type;
-    raw[idx++] = seq;
-    raw[idx++] = len;
-    if (len && payload) { memcpy(&raw[idx], payload, len); idx += len; }
-    uint16_t crc = crc16_ibm(&raw[1], idx - 1);
-    raw[idx++] = (uint8_t)(crc & 0xFF);
-    raw[idx++] = (uint8_t)((crc >> 8) & 0xFF);
-    
-    out_escaped[0] = SOF;
-    size_t esc_len = slip_escape(&raw[1], idx - 1, &out_escaped[1], out_max - 1);
-    return 1 + esc_len;
+    return e_idx;
 }
 
 /* =========================
- * PARSER SEGURO
+ * PARSER & RX TASK
  * ========================= */
-typedef enum { PS_WAIT_SOF = 0, PS_HDR_ADDR, PS_HDR_TYPE, PS_HDR_SEQ, PS_HDR_LEN, PS_PAYLOAD, PS_CRC_L, PS_CRC_H } parse_state_t;
-
+typedef enum { PS_WAIT_SOF, PS_HDR_ADDR, PS_HDR_TYPE, PS_HDR_SEQ, PS_HDR_LEN, PS_PAYLOAD, PS_CRC_L, PS_CRC_H } parse_state_t;
 typedef struct {
     parse_state_t st;
     bool esc_next;
     uint8_t addr, type, seq, len, payload[MAX_PAYLOAD], pay_i, crc_l, crc_h;
-    int64_t last_byte_us;
 } frame_parser_t;
 
 static void parser_reset(frame_parser_t *p) { p->st = PS_WAIT_SOF; p->esc_next = false; p->pay_i = 0; }
 
-static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
-{
-    int64_t now = esp_timer_get_time();
-    if (p->st != PS_WAIT_SOF && (now - p->last_byte_us) > 10000) parser_reset(p);
-    p->last_byte_us = now;
-
+static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
     if (byte == SOF) { parser_reset(p); p->st = PS_HDR_ADDR; return false; }
     if (p->st == PS_WAIT_SOF) return false;
-    
     if (p->esc_next) { byte ^= ESC_XOR; p->esc_next = false; }
     else if (byte == ESC) { p->esc_next = true; return false; }
 
@@ -166,8 +141,7 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
         case PS_HDR_SEQ:  p->seq  = byte; p->st = PS_HDR_LEN; break;
         case PS_HDR_LEN:  
             if (byte > MAX_PAYLOAD) { parser_reset(p); return false; }
-            p->len = byte; 
-            p->st = (p->len == 0) ? PS_CRC_L : PS_PAYLOAD; 
+            p->len = byte; p->st = (p->len == 0) ? PS_CRC_L : PS_PAYLOAD; 
             break;
         case PS_PAYLOAD:  
             p->payload[p->pay_i++] = byte; 
@@ -179,11 +153,8 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
             uint8_t tmp[4 + MAX_PAYLOAD];
             tmp[0] = p->addr; tmp[1] = p->type; tmp[2] = p->seq; tmp[3] = p->len;
             if (p->len) memcpy(&tmp[4], p->payload, p->len);
-            
             uint16_t calc = crc16_ibm(tmp, 4 + p->len);
-            uint16_t recv = (uint16_t)p->crc_l | (p->crc_h << 8);
-            
-            if (calc == recv) {
+            if (calc == ((uint16_t)p->crc_l | (p->crc_h << 8))) {
                 out_frame->addr = p->addr; out_frame->type = p->type; 
                 out_frame->seq = p->seq; out_frame->len = p->len;
                 if (p->len) memcpy(out_frame->payload, p->payload, p->len);
@@ -196,9 +167,6 @@ static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame)
     return false;
 }
 
-/* =========================
- * TASKS DE COMUNICAÇÃO
- * ========================= */
 static void rx_task(void *arg) {
     uint8_t buf[128];
     frame_parser_t parser;
@@ -213,7 +181,6 @@ static void rx_task(void *arg) {
                 }
             }
         }
-        vTaskDelay(1); // Crucial para evitar Watchdog
     }
 }
 
@@ -223,7 +190,6 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len, fra
     uint8_t txbuf[MAX_FRAME_ESC];
     size_t txlen = build_frame(ADDR_STM32, type, seq, payload, len, txbuf, sizeof(txbuf));
     
-    // Limpa fila
     frame_t dump;
     while (xQueueReceive(g_frame_q, &dump, 0) == pdTRUE);
 
@@ -243,64 +209,94 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len, fra
     return false;
 }
 
-static void ihm_sync_task(void *arg)
-{
+/* =========================
+ * LÓGICA DE SINCRONIZAÇÃO & LOOP
+ * ========================= */
+bool sync_params_to_mi() {
+    uint8_t tx_payload[3];
+    frame_t rep;
+    for (int i = 0; i < ACTIVE_PARAMS_COUNT; i++) {
+        tx_payload[0] = params[i].id;
+        tx_payload[1] = (uint8_t)(params[i].value >> 8);
+        tx_payload[2] = (uint8_t)(params[i].value & 0xFF);
+
+        if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) return false;
+        printf("Sincronizado %s: %d\n", params[i].name, params[i].value);
+    }
+    return true;
+}
+
+static void ihm_sync_task(void *arg) {
     frame_t rep;
     uint8_t tx_payload[9];
+    
+    printf("Aguardando 2s para inicialização...\n");
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // FASE 1: HANDSHAKE
+    printf("Iniciando Handshake...\n");
+    while (!sync_params_to_mi()) {
+        printf("Falha no Handshake. MI não responde. Tentando novamente...\n");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    printf("Handshake OK! Entrando em modo operacional.\n");
 
+    // FASE 2: LOOP OPERACIONAL
     while (1) {
-        // Reset de Erro
-        if (g_ihm_cmd.buttons & 0x04) { P90 = 0; E08 = false; }
-
-        tx_payload[0] = g_ihm_cmd.buttons;
-        tx_payload[1] = (uint8_t)(g_ihm_cmd.target_freq >> 8);
-        tx_payload[2] = (uint8_t)(g_ihm_cmd.target_freq & 0xFF);
-        tx_payload[3] = (uint8_t)(g_ihm_cmd.ramp_time >> 8);
-        tx_payload[4] = (uint8_t)(g_ihm_cmd.ramp_time & 0xFF);
-        tx_payload[5] = g_ihm_cmd.brake;
+        // Monta pacote de controle (9 bytes conforme esperado pelo MI)
+        tx_payload[0] = g_rt_data.buttons;
+        tx_payload[1] = (uint8_t)(g_rt_data.target_freq >> 8);
+        tx_payload[2] = (uint8_t)(g_rt_data.target_freq & 0xFF);
+        tx_payload[3] = 0; // Rampa tempo (opcional)
+        tx_payload[4] = 0; // Rampa tempo
+        tx_payload[5] = 0; // Brake
         tx_payload[6] = P90;
         tx_payload[7] = P91;
         tx_payload[8] = (uint8_t)E08;
 
-        if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 60)) {
-            // COMUNICAÇÃO OK: Decrementa P90 gradualmente
+        // DEBUG: O que estamos mandando?
+        printf(">> [TX] Cmd: 0x%02X | Freq: %d | P90: %d | E08: %d\n", 
+                tx_payload[0], g_rt_data.target_freq, P90, E08);
+
+        if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 100)) {
+            // Sucesso na comunicação
             if (P90 > 0) P90--;
-    
-            // Se P90 voltou para zona segura, limpa o erro E08
             if (P90 <= P91) E08 = false;
 
-            if (rep.len == 7) {
-                g_mi_status.current_speed = (rep.payload[0] << 8) | rep.payload[1];
-                g_mi_status.motor_current = (rep.payload[2] << 8) | rep.payload[3];
-                g_mi_status.bus_voltage   = (rep.payload[4] << 8) | rep.payload[5];
-                g_mi_status.temp          = rep.payload[6];
+            // DEBUG: O que o MI respondeu? (Sensores)
+            if (rep.len >= 7) {
+                uint16_t rpm = (rep.payload[0] << 8) | rep.payload[1];
+                uint16_t cur = (rep.payload[2] << 8) | rep.payload[3];
+                uint16_t bus = (rep.payload[4] << 8) | rep.payload[5];
+                uint8_t temp = rep.payload[6];
+                printf("<< [RX] Motor: %d RPM | %d mA | Bus: %d V | Temp: %d C\n", 
+                        rpm, cur, bus, temp);
             }
         } else {
+            // Falha na comunicação
             if (P90 < 100) P90++;
-            if (P90 > P91) E08 = true;
+            printf("!! [ERRO] Timeout na resposta do MI. P90: %d\n", P90);
         }
-        // Lógica de segurança inicial: Se P90 já começa maior que P91, força E08
-        if (P90 > P91) E08 = true;
 
-        printf("P90:%u P91:%u E08:%d | RPM:%u Curr:%umA\n", 
-               P90, P91, E08, g_mi_status.current_speed, g_mi_status.motor_current);
+        if (P90 > P91) {
+            E08 = true;
+            printf("!! [CRÍTICO] Erro E08 Ativo (Comunicação Perdida)\n");
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(1000)); 
+        vTaskDelay(pdMS_TO_TICKS(200)); // Loop a 5Hz
     }
 }
 
-void app_main(void)
-{
-    g_frame_q = xQueueCreate(FRAME_QUEUE_LEN, sizeof(frame_t));
+void app_main(void) {
+    nvs_flash_init();
+    g_frame_q = xQueueCreate(10, sizeof(frame_t));
 
     gpio_config_t io = { .pin_bit_mask = 1ULL << RS485_EN_PIN, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&io);
     rs485_set_tx(false);
 
     uart_config_t cfg = {
-        .baud_rate = UART_BAUD, .data_bits = UART_DATA_8_BITS,
+        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_EVEN, .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
     };
@@ -308,6 +304,6 @@ void app_main(void)
     uart_param_config(UART_PORT, &cfg);
     uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    xTaskCreate(rx_task, "rs485_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(rx_task, "rs485_rx", 4096, NULL, 10, NULL);
     xTaskCreate(ihm_sync_task, "ihm_sync", 4096, NULL, 5, NULL);
 }
