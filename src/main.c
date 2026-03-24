@@ -52,7 +52,16 @@ typedef struct {
 } param_t;
 
 param_t params[] = {
-    {10, 300, "P10"}, {11, 600, "P11"}, {30, 100, "P30"}, {31, 100, "P31"}, {91, 15, "P91"}
+    {10, 10, "P10"}, // Rampa de aceleração (5 a 60s)
+    {11, 10, "P11"}, // Rampa de desaceleração (5 a 60s)
+    {20, 1, "P20"}, // Freq. mínima (1 a 24Hz)
+    {21, 60, "P21"}, // Freq. máxima (23 a 90Hz)
+    {35, 0, "P35"}, // Compensação de torque (0 a 9)
+    {42, 5, "P42"}, // Freq. de chaveamento do IGBT (5, 10 ou 15kHz)
+    {43, 5, "P43"}, // Corrente de sobrecarga do motor (0 a 9A)
+    {44, 0, "P44"}, // Auto reset após falha (0 ou 1)
+    {45, 180, "P45"}, // Controle de tensão mínima (100 a 200 VAC)
+    {85, 1, "P85"}, // Modo do sensor de nível (0, 1(NF) ou 2(NA))
 };
 #define ACTIVE_PARAMS_COUNT (sizeof(params)/sizeof(params[0]))
 
@@ -70,7 +79,7 @@ typedef struct {
     uint16_t target_freq;  
 } ihm_rt_data_t;
 
-static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 600 }; // Teste: Start + 60Hz
+static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 20 }; // Teste: Start + 60Hz
 
 /* =========================
  * UTILITÁRIOS RS485 & CRC
