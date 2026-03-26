@@ -35,33 +35,27 @@
 #define ADDR_STM32          0x01
 #define TYPE_READ_STATUS    0x04 
 #define TYPE_WRITE_PARAM    0x05
-#define TYPE_ACK_MI         0x06
-#define TYPE_ACK            0x80
 
 #define MAX_PAYLOAD         128
 #define MAX_FRAME_RAW       (1 + 4 + MAX_PAYLOAD + 2)
 #define MAX_FRAME_ESC       (MAX_FRAME_RAW * 2)
 
 /* =========================
- * ESTRUTURAS DE DADOS
+ * VARIÁVEIS GLOBAIS E ESTRUTURAS
  * ========================= */
 typedef struct {
     uint8_t id;
     uint16_t value;
     const char* name;
+    bool pending_sync; 
 } param_t;
 
 param_t params[] = {
-    {10, 10, "P10"}, // Rampa de aceleração (5 a 60s)
-    {11, 10, "P11"}, // Rampa de desaceleração (5 a 60s)
-    {20, 1, "P20"}, // Freq. mínima (1 a 24Hz)
-    {21, 60, "P21"}, // Freq. máxima (23 a 90Hz)
-    {35, 0, "P35"}, // Compensação de torque (0 a 9)
-    {42, 5, "P42"}, // Freq. de chaveamento do IGBT (5, 10 ou 15kHz)
-    {43, 5, "P43"}, // Corrente de sobrecarga do motor (0 a 9A)
-    {44, 0, "P44"}, // Auto reset após falha (0 ou 1)
-    {45, 180, "P45"}, // Controle de tensão mínima (100 a 200 VAC)
-    {85, 1, "P85"}, // Modo do sensor de nível (0, 1(NF) ou 2(NA))
+    {10, 10, "P10", false}, {11, 7,  "P11", false},
+    {20, 1,  "P20", false}, {21, 60, "P21", false},
+    {35, 0,  "P35", false}, {42, 5,  "P42", false},
+    {43, 5,  "P43", false}, {44, 0,  "P44", false},
+    {45, 180,"P45", false}, {85, 1,  "P85", false},
 };
 #define ACTIVE_PARAMS_COUNT (sizeof(params)/sizeof(params[0]))
 
@@ -73,13 +67,14 @@ static uint8_t  P90 = 0;
 static uint8_t  P91 = 15; 
 static bool     E08 = false;  
 static QueueHandle_t g_frame_q = NULL;
+static bool     g_show_logs = false; // CONTROLE DE LOGS
 
 typedef struct {
     uint8_t  buttons;      
     uint16_t target_freq;  
 } ihm_rt_data_t;
 
-static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 20 }; // Teste: Start + 60Hz
+static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 20 };
 
 /* =========================
  * UTILITÁRIOS RS485 & CRC
@@ -219,91 +214,141 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len, fra
 }
 
 /* =========================
- * LÓGICA DE SINCRONIZAÇÃO & LOOP
+ * LÓGICA DE SINCRONIZAÇÃO E MUDANÇA
  * ========================= */
-bool sync_params_to_mi() {
+
+void user_change_param(uint8_t id, uint16_t new_val) {
+    for (int i = 0; i < ACTIVE_PARAMS_COUNT; i++) {
+        if (params[i].id == id) {
+            params[i].value = new_val;
+            params[i].pending_sync = true;
+            printf("\n[MENU] %s alterado para %d. Aguardando parada do motor para sync.\n", params[i].name, new_val);
+            return;
+        }
+    }
+    printf("\n[ERRO] Parametro P%d nao encontrado.\n", id);
+}
+
+bool sync_params_to_mi(bool force_all) {
     uint8_t tx_payload[3];
     frame_t rep;
     for (int i = 0; i < ACTIVE_PARAMS_COUNT; i++) {
-        tx_payload[0] = params[i].id;
-        tx_payload[1] = (uint8_t)(params[i].value >> 8);
-        tx_payload[2] = (uint8_t)(params[i].value & 0xFF);
+        if (force_all || params[i].pending_sync) {
+            tx_payload[0] = params[i].id;
+            tx_payload[1] = (uint8_t)(params[i].value >> 8);
+            tx_payload[2] = (uint8_t)(params[i].value & 0xFF);
 
-        if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) return false;
-        printf("Sincronizado %s: %d\n", params[i].name, params[i].value);
+            if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) return false;
+            
+            params[i].pending_sync = false;
+            printf("[OK] Sincronizado %s: %d\n", params[i].name, params[i].value);
+        }
     }
     return true;
 }
 
+/* =========================
+ * TASK DE COMUNICAÇÃO PRINCIPAL
+ * ========================= */
 static void ihm_sync_task(void *arg) {
     frame_t rep;
     uint8_t tx_payload[9];
-    
-    printf("Aguardando 2s para inicialização...\n");
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // FASE 1: HANDSHAKE
     printf("Iniciando Handshake...\n");
-    while (!sync_params_to_mi()) {
-        printf("Falha no Handshake. MI não responde. Tentando novamente...\n");
+    while (!sync_params_to_mi(true)) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    printf("Handshake OK! Entrando em modo operacional.\n");
+    printf("Handshake OK! Logs silenciados por padrao. Use 'MON' para ver o trafego.\n");
 
-    // FASE 2: LOOP OPERACIONAL
     while (1) {
-        // Monta pacote de controle (9 bytes conforme esperado pelo MI)
         tx_payload[0] = g_rt_data.buttons;
         tx_payload[1] = (uint8_t)(g_rt_data.target_freq >> 8);
         tx_payload[2] = (uint8_t)(g_rt_data.target_freq & 0xFF);
-        tx_payload[3] = 0; // Rampa tempo (opcional)
-        tx_payload[4] = 0; // Rampa tempo
-        tx_payload[5] = 0; // Brake
-        tx_payload[6] = P90;
-        tx_payload[7] = P91;
-        tx_payload[8] = (uint8_t)E08;
+        tx_payload[3] = 0; tx_payload[4] = 0; tx_payload[5] = 0; 
+        tx_payload[6] = P90; tx_payload[7] = P91; tx_payload[8] = (uint8_t)E08;
 
-        // DEBUG: O que estamos mandando?
-        printf(">> [TX] Cmd: 0x%02X | Freq: %d | P90: %d | E08: %d\n", 
-                tx_payload[0], g_rt_data.target_freq, P90, E08);
+        // SÓ MOSTRA SE O USUÁRIO PEDIR VIA COMANDO 'MON'
+        if (g_show_logs) {
+            printf(">> [TX] Cmd: 0x%02X | Freq: %d | P90: %d\n", tx_payload[0], g_rt_data.target_freq, P90);
+        }
 
         if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 100)) {
-            // Sucesso na comunicação
             if (P90 > 0) P90--;
             if (P90 <= P91) E08 = false;
 
-            // DEBUG: O que o MI respondeu? (Sensores)
             if (rep.len >= 7) {
                 uint16_t rpm = (rep.payload[0] << 8) | rep.payload[1];
-                uint16_t cur = (rep.payload[2] << 8) | rep.payload[3];
-                uint16_t bus = (rep.payload[4] << 8) | rep.payload[5];
-                uint8_t temp = rep.payload[6];
-                printf("<< [RX] Motor: %d RPM | %d mA | Bus: %d V | Temp: %d C\n", 
-                        rpm, cur, bus, temp);
+                if (g_show_logs) {
+                    printf("<< [RX] Motor: %d RPM\n", rpm);
+                }
+                
+                // Handshake automático na parada
+                bool needs_sync = false;
+                for (int i = 0; i < ACTIVE_PARAMS_COUNT; i++) {
+                    if (params[i].pending_sync) { needs_sync = true; break; }
+                }
+
+                if (needs_sync && rpm == 0) {
+                    printf("\n*** Motor parado. Sincronizando... ***\n");
+                    sync_params_to_mi(false);
+                }
             }
         } else {
-            // Falha na comunicação
             if (P90 < 100) P90++;
-            printf("!! [ERRO] Timeout na resposta do MI. P90: %d\n", P90);
+            if (g_show_logs) printf("!! [ERRO] Timeout MI\n");
         }
 
-        if (P90 > P91) {
-            E08 = true;
-            printf("!! [CRÍTICO] Erro E08 Ativo (Comunicação Perdida)\n");
-        }
+        if (P90 > P91) E08 = true;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
-        vTaskDelay(pdMS_TO_TICKS(200)); // Loop a 5Hz
+/* =========================
+ * TASK DE CONSOLE (SEM BLOQUEIO)
+ * ========================= */
+static void serial_console_task(void *arg) {
+    char line[32];
+    int rx_pos = 0;
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    while (1) {
+        int c = fgetc(stdin);
+        if (c != EOF) {
+            if (c == '\n' || c == '\r') {
+                line[rx_pos] = '\0';
+                if (rx_pos > 0) {
+                    // COMANDOS DE CONTROLE DE LOG
+                    if (strcmp(line, "MON") == 0) {
+                        g_show_logs = true;
+                        printf("\n[LOGS ATIVADOS]\n");
+                    } else if (strcmp(line, "SIL") == 0) {
+                        g_show_logs = false;
+                        printf("\n[LOGS SILENCIADOS]\n");
+                    } else {
+                        // Tenta parsear Pxx=yy
+                        uint8_t id; uint16_t val;
+                        if (sscanf(line, "P%hhu=%hu", &id, &val) == 2) {
+                            user_change_param(id, val);
+                        }
+                    }
+                }
+                rx_pos = 0;
+            } else if (rx_pos < sizeof(line) - 1) {
+                line[rx_pos++] = (char)c;
+                fputc(c, stdout); // Echo para você ver o que digita
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void app_main(void) {
     nvs_flash_init();
     g_frame_q = xQueueCreate(10, sizeof(frame_t));
-
     gpio_config_t io = { .pin_bit_mask = 1ULL << RS485_EN_PIN, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&io);
-    rs485_set_tx(false);
-
+    
     uart_config_t cfg = {
         .baud_rate = 115200, .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_EVEN, .stop_bits = UART_STOP_BITS_1,
@@ -315,4 +360,5 @@ void app_main(void) {
 
     xTaskCreate(rx_task, "rs485_rx", 4096, NULL, 10, NULL);
     xTaskCreate(ihm_sync_task, "ihm_sync", 4096, NULL, 5, NULL);
+    xTaskCreate(serial_console_task, "console", 4096, NULL, 3, NULL);
 }
