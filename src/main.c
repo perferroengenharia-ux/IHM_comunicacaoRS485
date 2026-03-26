@@ -41,7 +41,7 @@
 #define MAX_FRAME_ESC       (MAX_FRAME_RAW * 2)
 
 /* =========================
- * VARIÁVEIS GLOBAIS E ESTRUTURAS
+ * ESTRUTURAS DE DADOS E TELEMETRIA
  * ========================= */
 typedef struct {
     uint8_t id;
@@ -59,22 +59,34 @@ param_t params[] = {
 };
 #define ACTIVE_PARAMS_COUNT (sizeof(params)/sizeof(params[0]))
 
+// Estrutura para os dados que o IHM envia ao MI
 typedef struct {
-    uint8_t addr, type, seq, len, payload[MAX_PAYLOAD];
-} frame_t;
+    uint8_t  buttons;       // Bitmask: Bit0=Start, Bit1=Stop, Bit2=Up, Bit3=Down
+    uint16_t target_freq;   // Frequência alvo (ex: 6000 para 60.00Hz)
+    uint8_t  direction;     // 0 = Horário (FWD), 1 = Anti-horário (REV)
+} ihm_control_t;
+
+// Estrutura para a Telemetria que o MI envia ao IHM
+typedef struct {
+    uint16_t current_freq;  // Freq. Atual
+    uint16_t v_bus;         // Tensão Barramento CC
+    uint16_t i_out;         // Corrente de Saída (mA)
+    uint16_t v_out;         // Tensão de Saída (V)
+    uint8_t  temp_igbt;     // Temperatura IGBTs
+} mi_telemetry_t;
+
+static ihm_control_t g_control = { .buttons = 0, .target_freq = 2000, .direction = 0 };
+static mi_telemetry_t g_telemetry = { 0 };
 
 static uint8_t  P90 = 0;      
 static uint8_t  P91 = 15; 
 static bool     E08 = false;  
 static QueueHandle_t g_frame_q = NULL;
-static bool     g_show_logs = false; // CONTROLE DE LOGS
+static bool     g_show_logs = false; 
 
 typedef struct {
-    uint8_t  buttons;      
-    uint16_t target_freq;  
-} ihm_rt_data_t;
-
-static ihm_rt_data_t g_rt_data = { .buttons = 0x01, .target_freq = 20 };
+    uint8_t addr, type, seq, len, payload[MAX_PAYLOAD];
+} frame_t;
 
 /* =========================
  * UTILITÁRIOS RS485 & CRC
@@ -214,7 +226,7 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len, fra
 }
 
 /* =========================
- * LÓGICA DE SINCRONIZAÇÃO E MUDANÇA
+ * LÓGICA DE SINCRONIZAÇÃO
  * ========================= */
 
 void user_change_param(uint8_t id, uint16_t new_val) {
@@ -222,7 +234,7 @@ void user_change_param(uint8_t id, uint16_t new_val) {
         if (params[i].id == id) {
             params[i].value = new_val;
             params[i].pending_sync = true;
-            printf("\n[MENU] %s alterado para %d. Aguardando parada do motor para sync.\n", params[i].name, new_val);
+            printf("\n[MENU] %s alterado para %d. Pendente sync na parada.\n", params[i].name, new_val);
             return;
         }
     }
@@ -237,9 +249,7 @@ bool sync_params_to_mi(bool force_all) {
             tx_payload[0] = params[i].id;
             tx_payload[1] = (uint8_t)(params[i].value >> 8);
             tx_payload[2] = (uint8_t)(params[i].value & 0xFF);
-
             if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) return false;
-            
             params[i].pending_sync = false;
             printf("[OK] Sincronizado %s: %d\n", params[i].name, params[i].value);
         }
@@ -248,7 +258,7 @@ bool sync_params_to_mi(bool force_all) {
 }
 
 /* =========================
- * TASK DE COMUNICAÇÃO PRINCIPAL
+ * TASK DE COMUNICAÇÃO PRINCIPAL (LOOP REAL)
  * ========================= */
 static void ihm_sync_task(void *arg) {
     frame_t rep;
@@ -256,41 +266,51 @@ static void ihm_sync_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     printf("Iniciando Handshake...\n");
-    while (!sync_params_to_mi(true)) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    printf("Handshake OK! Logs silenciados por padrao. Use 'MON' para ver o trafego.\n");
+    while (!sync_params_to_mi(true)) vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("Handshake OK! Logs silenciados. 'MON' para ver.\n");
 
     while (1) {
-        tx_payload[0] = g_rt_data.buttons;
-        tx_payload[1] = (uint8_t)(g_rt_data.target_freq >> 8);
-        tx_payload[2] = (uint8_t)(g_rt_data.target_freq & 0xFF);
-        tx_payload[3] = 0; tx_payload[4] = 0; tx_payload[5] = 0; 
-        tx_payload[6] = P90; tx_payload[7] = P91; tx_payload[8] = (uint8_t)E08;
+        // --- MONTAR PAYLOAD (IHM -> MI) ---
+        tx_payload[0] = g_control.buttons;
+        tx_payload[1] = (uint8_t)(g_control.target_freq >> 8);
+        tx_payload[2] = (uint8_t)(g_control.target_freq & 0xFF);
+        tx_payload[3] = g_control.direction;
+        tx_payload[4] = 0; // Reservado
+        tx_payload[5] = 0; // Reservado
+        tx_payload[6] = P90;
+        tx_payload[7] = P91;
+        tx_payload[8] = (uint8_t)E08;
 
-        // SÓ MOSTRA SE O USUÁRIO PEDIR VIA COMANDO 'MON'
         if (g_show_logs) {
-            printf(">> [TX] Cmd: 0x%02X | Freq: %d | P90: %d\n", tx_payload[0], g_rt_data.target_freq, P90);
+            printf(">> [TX] BTN: 0x%02X | Alvo: %d | Dir: %d\n", 
+                    g_control.buttons, g_control.target_freq, g_control.direction);
         }
 
         if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 100)) {
             if (P90 > 0) P90--;
             if (P90 <= P91) E08 = false;
 
-            if (rep.len >= 7) {
-                uint16_t rpm = (rep.payload[0] << 8) | rep.payload[1];
+            // --- PROCESSAR RESPOSTA (MI -> IHM) ---
+            if (rep.len >= 9) {
+                g_telemetry.current_freq = (rep.payload[0] << 8) | rep.payload[1];
+                g_telemetry.i_out        = (rep.payload[2] << 8) | rep.payload[3];
+                g_telemetry.v_bus        = (rep.payload[4] << 8) | rep.payload[5];
+                g_telemetry.v_out        = (rep.payload[6] << 8) | rep.payload[7];
+                g_telemetry.temp_igbt    = rep.payload[8];
+
                 if (g_show_logs) {
-                    printf("<< [RX] Motor: %d RPM\n", rpm);
+                    printf("<< [RX] Freq: %d | Cur: %d | Bus: %d | Vout: %d | Temp: %d\n",
+                           g_telemetry.current_freq, g_telemetry.i_out, 
+                           g_telemetry.v_bus, g_telemetry.v_out, g_telemetry.temp_igbt);
                 }
                 
-                // Handshake automático na parada
+                // Handshake de parada se houver pendência
                 bool needs_sync = false;
                 for (int i = 0; i < ACTIVE_PARAMS_COUNT; i++) {
                     if (params[i].pending_sync) { needs_sync = true; break; }
                 }
-
-                if (needs_sync && rpm == 0) {
-                    printf("\n*** Motor parado. Sincronizando... ***\n");
+                if (needs_sync && g_telemetry.current_freq == 0) {
+                    printf("\n*** Motor Parado (0 Hz). Sincronizando Pendencias... ***\n");
                     sync_params_to_mi(false);
                 }
             }
@@ -300,15 +320,15 @@ static void ihm_sync_task(void *arg) {
         }
 
         if (P90 > P91) E08 = true;
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
 /* =========================
- * TASK DE CONSOLE (SEM BLOQUEIO)
+ * TASK DE CONSOLE (SIMULAÇÃO)
  * ========================= */
 static void serial_console_task(void *arg) {
-    char line[32];
+    char line[48];
     int rx_pos = 0;
     setvbuf(stdin, NULL, _IONBF, 0);
 
@@ -318,25 +338,29 @@ static void serial_console_task(void *arg) {
             if (c == '\n' || c == '\r') {
                 line[rx_pos] = '\0';
                 if (rx_pos > 0) {
-                    // COMANDOS DE CONTROLE DE LOG
-                    if (strcmp(line, "MON") == 0) {
-                        g_show_logs = true;
-                        printf("\n[LOGS ATIVADOS]\n");
-                    } else if (strcmp(line, "SIL") == 0) {
-                        g_show_logs = false;
-                        printf("\n[LOGS SILENCIADOS]\n");
-                    } else {
-                        // Tenta parsear Pxx=yy
+                    if (strcmp(line, "MON") == 0) { g_show_logs = true; printf("\n[LOGS ON]\n"); }
+                    else if (strcmp(line, "SIL") == 0) { g_show_logs = false; printf("\n[LOGS OFF]\n"); }
+                    else if (strncmp(line, "BT=", 3) == 0) {
+                        g_control.buttons = (uint8_t)atoi(&line[3]);
+                        printf("\n[CONTROLE] Botao definido para: 0x%02X\n", g_control.buttons);
+                    }
+                    else if (strncmp(line, "DIR=", 4) == 0) {
+                        g_control.direction = (uint8_t)atoi(&line[4]);
+                        printf("\n[CONTROLE] Sentido: %s\n", g_control.direction ? "REV" : "FWD");
+                    }
+                    else if (strncmp(line, "FR=", 3) == 0) {
+                        g_control.target_freq = (uint16_t)atoi(&line[3]);
+                        printf("\n[CONTROLE] Freq Alvo: %d\n", g_control.target_freq);
+                    }
+                    else {
                         uint8_t id; uint16_t val;
-                        if (sscanf(line, "P%hhu=%hu", &id, &val) == 2) {
-                            user_change_param(id, val);
-                        }
+                        if (sscanf(line, "P%hhu=%hu", &id, &val) == 2) user_change_param(id, val);
                     }
                 }
                 rx_pos = 0;
             } else if (rx_pos < sizeof(line) - 1) {
                 line[rx_pos++] = (char)c;
-                fputc(c, stdout); // Echo para você ver o que digita
+                fputc(c, stdout);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
