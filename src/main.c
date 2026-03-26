@@ -320,7 +320,7 @@ static void ihm_sync_task(void *arg) {
         }
 
         if (P90 > P91) E08 = true;
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
